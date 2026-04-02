@@ -1,0 +1,19 @@
+{
+  "name": "iiwtmt-bot",
+  "version": "1.0.0",
+  "description": "Is It Worth My Time? — Telegram bot for decision clarity",
+  "main": "bot.js",
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
