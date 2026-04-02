@@ -1,11 +1,11 @@
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const sessions = new Map();
 const FREE_LIMIT = 10;
@@ -48,13 +48,15 @@ Rules:
 - Always be honest, even if uncomfortable.`;
 
 async function analyseDecision(decisionText) {
-  const message = await anthropic.messages.create({
-    model: "claude-sonnet-4-20250514",
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
     max_tokens: 600,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: `Decision: ${decisionText}` }],
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: `Decision: ${decisionText}` }
+    ],
   });
-  return message.content[0].text;
+  return response.choices[0].message.content;
 }
 
 bot.onText(/\/start/, (msg) => {
