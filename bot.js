@@ -7,139 +7,178 @@ dotenv.config();
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ── Session store (in-memory — resets on redeploy) ───────────────────────────
-// Structure: { chatId: { count, lastUsed, pendingDecision } }
-// TODO Phase 1: move to Supabase so sessions persist across redeploys
+// ── Session store ─────────────────────────────────────────────────────────────
+// TODO Phase 1: move to Supabase — sessions reset on every Railway redeploy
 const sessions = new Map();
 const FREE_LIMIT = 10;
 
 function getSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { count: 0, lastUsed: null, pendingDecision: null });
+    sessions.set(chatId, {
+      count: 0,
+      lastUsed: null,
+      lastDecision: null,
+      awaitingContext: false,
+    });
   }
   return sessions.get(chatId);
 }
 
-// ── Triage prompt ─────────────────────────────────────────────────────────────
-// Fast, cheap call — reads the decision and decides if clarification is needed
-const TRIAGE_PROMPT = `You are a decision triage assistant. Your only job is to decide if a decision needs one clarifying question before analysis, or can be analysed directly.
-
-A decision is CLEAR if:
-- The context is obvious from the text (e.g. mentions money, work, a specific person, a timeframe, a role)
-- Adding a clarifying question would feel annoying or patronising
-
-A decision is AMBIGUOUS if:
-- The context would genuinely change the analysis in a meaningful way
-- Without it, the analysis would be noticeably generic
-
-Respond ONLY with valid JSON in this exact format — nothing else:
-{
-  "needsClarification": true or false,
-  "inferredContext": "one sentence describing what you inferred about the decision type and stakes",
-  "clarifyingQuestion": "one short, specific question — only if needsClarification is true, otherwise null"
-}`;
-
 // ── Analysis prompt ───────────────────────────────────────────────────────────
-const ANALYSIS_PROMPT = `You are "Is It Worth My Time?" — a sharp, honest, and grounded decision-clarity assistant.
+const ANALYSIS_PROMPT = `You are "Is It Worth My Time?" — a sharp, honest decision-clarity assistant.
 
-Your job: help the person think more clearly by surfacing what they haven't fully calculated yet — the real time cost, hidden obligations, and what this decision actually reveals about where they are right now.
+Your job: surface what the person hasn't fully calculated — real time cost, hidden obligations, what this decision reveals.
 
-CRITICAL RULES FOR SPECIFICITY:
-- You MUST reference the exact details from their decision in every section. If they mentioned a number, use it. If they mentioned a timeframe, use it. If they mentioned a person or context, reference it directly.
-- NEVER write generic advice that could apply to anyone. Every sentence must be unmistakably about THIS specific decision.
-- If something is unclear, make a reasonable assumption and state it briefly in one phrase.
+== SPECIFICITY — NON-NEGOTIABLE ==
+Every sentence must be about THIS specific decision.
+Reference the person's exact words, numbers, timeframes, and context throughout.
+Never write a sentence that could apply to any decision.
 
-FORMAT YOUR RESPONSE EXACTLY like this:
+BAD: "This could affect your productivity and requires careful time management."
+GOOD: "The ₹40k project runs 6 weeks — that's your SaleIQ build limited to evenings until mid-May."
+
+== HANDLING MISSING INFORMATION ==
+
+If a piece of info is MISSING BUT MINOR (analysis holds either way):
+- Make a reasonable assumption
+- Flag it clearly inline like this: _(assuming X)_
+- Continue with the analysis
+
+If a piece of info is MISSING AND CENTRAL (the entire analysis would change without it):
+- Do NOT analyse
+- Do NOT assume
+- Respond with ONLY this exact format:
+  "Before I can give you a useful analysis — [one precise, specific question]"
+- Nothing else. Wait for their answer before analysing.
+
+== FORMAT ==
 
 ⏱️ *Time & Energy Cost*
-The real cost of THIS decision. Not just hours — mental load, follow-on commitments, energy drain. Use their actual numbers. Quantify what you can.
+Real cost of THIS decision. Hours, mental load, follow-on commitments. Use their actual numbers.
 
 🧊 *What You Might Be Missing*
-The specific hidden costs THIS person in THIS situation likely hasn't calculated. What comes attached to this decision that they haven't mentioned.
+Specific hidden costs THIS person hasn't counted. What comes attached to their situation they haven't mentioned.
 
 🔮 *Pre-Mortem*
-The single most likely specific reason THIS decision leads to regret. Not generic. Name it precisely.
+The single most likely specific reason THIS decision leads to regret. Name it precisely.
 
 💡 *The Signal*
-What saying yes or no to THIS specific decision reveals about where this person is right now — a priority, a constraint, or a pattern worth noticing. One honest observation.
+What this decision reveals about where this person is right now. One honest observation tied to something they said.
 
 📍 *Lean*
-Yes / No / Yes but only if [specific condition] — one sentence tied directly to their situation. A suggestion, not a verdict.
+Yes / No / Yes but only if [specific condition]. One sentence. A suggestion, not a verdict.
 
 ---
-Rules:
-- Under 300 words total. Telegram is mobile.
-- 2-3 sentences per section. No padding.
-- Match tone to stakes: light for trivial decisions, careful for major ones.
-- Never preachy. Never moralistic.
-- Use the inferred context and any clarification provided to sharpen every section.`;
+Then on a new line, ONE of:
+- If one specific piece of context would meaningfully sharpen the analysis: ask that precise question
+- Otherwise write: "_Want to add anything? Reply and I'll re-analyse with the extra context._"
 
-// ── API calls ─────────────────────────────────────────────────────────────────
-async function triageDecision(decisionText) {
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    max_tokens: 150,
-    messages: [
-      { role: "system", content: TRIAGE_PROMPT },
-      { role: "user", content: `Decision: ${decisionText}` }
-    ],
-  });
-  const raw = response.choices[0].message.content;
-  return JSON.parse(raw.replace(/```json|```/g, "").trim());
-}
+== RULES ==
+- Under 300 words for the main analysis
+- 2-3 sentences per section
+- Light tone for small decisions, careful for major ones
+- Never preachy, never moralistic
+- If the user provided additional context, use it to sharpen every section`;
 
-async function analyseDecision(decisionText, inferredContext, clarification) {
-  let userContent = `Decision: ${decisionText}`;
-  if (inferredContext) userContent += `\nInferred context: ${inferredContext}`;
-  if (clarification) userContent += `\nUser clarification: ${clarification}`;
+// ── Re-analysis prompt ────────────────────────────────────────────────────────
+const REANALYSIS_PROMPT = `You are "Is It Worth My Time?" — a sharp, honest decision-clarity assistant.
+
+The user submitted a decision and you gave an initial analysis. They have now added more context. Use everything — original decision plus new context — to give a sharper re-analysis.
+
+Same rules:
+- Every sentence must reference their specific situation
+- Flag any remaining assumptions with _(assuming X)_
+- Should be noticeably more precise than the first pass
+
+Same format:
+⏱️ *Time & Energy Cost*
+🧊 *What You Might Be Missing*
+🔮 *Pre-Mortem*
+💡 *The Signal*
+📍 *Lean*
+
+End with: "_Updated with your context._"
+
+Under 300 words. 2-3 sentences per section. Never generic.`;
+
+// ── API call ──────────────────────────────────────────────────────────────────
+async function callAnalysis(prompt, decisionText, additionalContext) {
+  let userContent = `Decision: "${decisionText}"`;
+  if (additionalContext) {
+    userContent += `\n\nUser added context: "${additionalContext}"`;
+  }
 
   const response = await openai.chat.completions.create({
     model: "gpt-4o",
     max_tokens: 700,
     messages: [
-      { role: "system", content: ANALYSIS_PROMPT },
+      { role: "system", content: prompt },
       { role: "user", content: userContent }
     ],
   });
+
   return response.choices[0].message.content;
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────
-// TODO Phase 1: replace console.log with Supabase inserts
-// Table needed: decisions(id, chat_id, decision_text, context, analysis, created_at)
-function logDecision(chatId, decision, context, analysis) {
+// TODO Phase 1: replace with Supabase insert
+// Table: decisions(id, chat_id, decision_text, context, analysis, created_at)
+function logDecision(chatId, decision, context, analysisLength) {
   console.log(JSON.stringify({
     event: "decision_analysed",
     chat_id: chatId,
     decision,
-    context,
-    analysis_length: analysis.length,
+    context: context || null,
+    analysis_length: analysisLength,
     timestamp: new Date().toISOString()
   }));
 }
 
-// ── Helper: send analysis + follow-up ────────────────────────────────────────
-async function sendAnalysis(chatId, decision, inferredContext, clarification, session) {
+// ── Send analysis ─────────────────────────────────────────────────────────────
+async function sendAnalysis(chatId, decision, additionalContext, session, isReanalysis) {
   bot.sendChatAction(chatId, "typing");
 
   try {
-    const analysis = await analyseDecision(decision, inferredContext, clarification);
-    session.count += 1;
-    session.lastUsed = new Date().toISOString();
-    const remaining = FREE_LIMIT - session.count;
+    const prompt = isReanalysis ? REANALYSIS_PROMPT : ANALYSIS_PROMPT;
+    const analysis = await callAnalysis(prompt, decision, additionalContext);
 
-    logDecision(chatId, decision, inferredContext || clarification, analysis);
+    // Detect if model asked a clarifying question instead of analysing
+    // (triggered when a central piece of info is missing)
+    const isClarifyingQuestion =
+      analysis.trim().startsWith("Before I can") ||
+      analysis.trim().startsWith("Before giving");
+
+    if (isClarifyingQuestion) {
+      // Store decision, wait for answer — don't count against free limit
+      session.lastDecision = decision;
+      session.awaitingContext = true;
+      await bot.sendMessage(chatId, analysis, { parse_mode: "Markdown" });
+      return;
+    }
+
+    // Normal analysis
+    if (!isReanalysis) {
+      session.count += 1;
+      session.lastUsed = new Date().toISOString();
+      session.lastDecision = decision;
+      session.awaitingContext = false;
+    }
+
+    logDecision(chatId, decision, additionalContext, analysis.length);
 
     await bot.sendMessage(chatId, analysis, { parse_mode: "Markdown" });
 
-    const followUp = remaining > 0
-      ? `_${remaining} free ${remaining === 1 ? "analysis" : "analyses"} remaining._`
-      : `_That was your last free analysis. Full platform coming soon._`;
+    if (!isReanalysis) {
+      const remaining = FREE_LIMIT - session.count;
+      const followUp = remaining > 0
+        ? `_${remaining} free ${remaining === 1 ? "analysis" : "analyses"} remaining._`
+        : `_That was your last free analysis. Full platform coming soon._`;
+      await bot.sendMessage(chatId, followUp, { parse_mode: "Markdown" });
+    }
 
-    await bot.sendMessage(chatId, followUp, { parse_mode: "Markdown" });
   } catch (err) {
     console.error("Analysis error:", err);
-    session.pendingDecision = null;
+    session.awaitingContext = false;
     bot.sendMessage(chatId, `Something went wrong. Try again in a moment.`);
   }
 }
@@ -150,7 +189,7 @@ bot.onText(/\/start/, (msg) => {
   const name = msg.from.first_name || "there";
   bot.sendMessage(
     chatId,
-    `Hey ${name} 👋\n\nI'm *Is It Worth My Time?*\n\nSend me any decision — big or small — and I'll help you think through it clearly.\n\nExamples:\n_"Should I take this freelance project at ₹40k for 3 weeks?"_\n_"Is it worth attending this 3-hour workshop on Saturday?"_\n_"Should I hire a developer or keep building myself?"_\n\nYou get *${FREE_LIMIT} free analyses*. Make them count. 🎯`,
+    `Hey ${name} 👋\n\nI'm *Is It Worth My Time?*\n\nSend me any decision — big or small — and I'll analyse it immediately.\n\nThe more specific you are, the sharper the output. Numbers, timeframes, context — all help.\n\nExamples:\n_"Should I take this freelance project at ₹40k for 3 weeks?"_\n_"Is it worth attending this 3-hour workshop on Saturday?"_\n_"Should I keep building two projects or focus on one?"_\n\nYou get *${FREE_LIMIT} free analyses*. Make them count. 🎯`,
     { parse_mode: "Markdown" }
   );
 });
@@ -159,7 +198,7 @@ bot.onText(/\/help/, (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(
     chatId,
-    `*How to use this bot*\n\nJust send me a decision in plain language. One sentence is enough.\n\n*What I look at:*\n• Real time & energy cost — specific to your situation\n• Hidden obligations you might miss\n• Pre-mortem — the most likely specific reason for regret\n• What the decision reveals about where you are right now\n• A clear lean with reasoning\n\n*Commands:*\n/start — Welcome\n/help — This message\n/count — Analyses used\n\nI reason. I don't decide. You always make the final call.`,
+    `*How to use this bot*\n\nSend a decision in plain language. I'll analyse it straight away.\n\n*What I surface:*\n• Real time & energy cost — with your actual numbers\n• Hidden obligations you haven't counted\n• The most likely specific reason for regret\n• What the decision reveals about where you are right now\n• A clear lean with reasoning\n\n*How assumptions work:*\nIf I need to assume something minor, I'll flag it clearly in the output. If I need one central piece of info before I can give you a useful analysis, I'll ask — once.\n\nAfter any analysis, reply with more context and I'll re-analyse with the extra detail — no extra charge.\n\n*Commands:*\n/start — Welcome\n/help — This message\n/count — Analyses used\n\nI reason. I don't decide. You always make the final call.`,
     { parse_mode: "Markdown" }
   );
 });
@@ -198,35 +237,33 @@ bot.on("message", async (msg) => {
     return;
   }
 
-  // Step 2 — pending decision exists, this message is the clarification
-  if (session.pendingDecision) {
-    const { decision, inferredContext } = session.pendingDecision;
-    const clarification = text;
-    session.pendingDecision = null;
-    await sendAnalysis(chatId, decision, inferredContext, clarification, session);
+  // Case 1: bot asked a clarifying question — this message is the answer
+  if (session.awaitingContext && session.lastDecision) {
+    const decision = session.lastDecision;
+    session.awaitingContext = false;
+    session.lastDecision = null;
+    await sendAnalysis(chatId, decision, text, session, false);
     return;
   }
 
-  // Step 1 — new decision: triage first
-  bot.sendChatAction(chatId, "typing");
+  // Case 2: user is adding context to a recent decision
+  // Conditions: within 5 mins, short reply (under 80 chars), no question mark
+  const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const hasRecentDecision =
+    session.lastDecision &&
+    session.lastUsed &&
+    session.lastUsed > fiveMinutesAgo;
+  const looksLikeContext = text.length < 80 && !text.includes("?");
 
-  try {
-    const triage = await triageDecision(text);
-
-    if (triage.needsClarification) {
-      session.pendingDecision = {
-        decision: text,
-        inferredContext: triage.inferredContext
-      };
-      await bot.sendMessage(chatId, triage.clarifyingQuestion, { parse_mode: "Markdown" });
-    } else {
-      await sendAnalysis(chatId, text, triage.inferredContext, null, session);
-    }
-  } catch (err) {
-    console.error("Triage error:", err);
-    // Triage failed — fall back to direct analysis without context
-    await sendAnalysis(chatId, text, null, null, session);
+  if (hasRecentDecision && looksLikeContext) {
+    await sendAnalysis(chatId, session.lastDecision, text, session, true);
+    return;
   }
+
+  // Case 3: new decision — analyse immediately
+  session.lastDecision = null;
+  session.awaitingContext = false;
+  await sendAnalysis(chatId, text, null, session, false);
 });
 
 // ── Error handling ────────────────────────────────────────────────────────────
